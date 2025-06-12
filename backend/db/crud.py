@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 from . import models
+from datetime import datetime
 
 def get_user_by_google_id(db: Session, google_id: str):
     """ Searches for a user by their Google ID. """
@@ -32,3 +33,39 @@ def create_or_update_user(db: Session, google_id: str, email: str, access_token:
     db.commit()
     db.refresh(db_user)
     return db_user
+
+def add_steps_data(db: Session, user_id: int, data: list[dict]): 
+    """ Dodaje wpisy dotyczące kroków dla danego użytkownika. """
+    objects_to_add = []
+    for entry in data:
+        # Ten kod konwertujący timestamp jest specyficzny dla kroków,
+        # ponieważ w poprzednim kroku tak go napisaliśmy. Uprośćmy go.
+        # Nowa, uniwersalna funkcja parse_aggregate_response już zwraca obiekty datetime.
+        db_entry = models.Steps(
+            user_id=user_id,
+            timestamp=entry["timestamp"],
+            value=entry["value"]
+        )
+        objects_to_add.append(db_entry)
+        
+    db.bulk_save_objects(objects_to_add)
+
+def add_heart_rate_data(db: Session, user_id: int, data: list[dict]):
+    objects_to_add = [models.HeartRate(user_id=user_id, **entry) for entry in data]
+    db.bulk_save_objects(objects_to_add)
+    db.commit()
+
+def add_sleep_data(db: Session, user_id: int, data: list[dict]):
+    objects_to_add = [models.Sleep(user_id=user_id, **entry) for entry in data]
+    db.bulk_save_objects(objects_to_add)
+    db.commit()
+
+def add_blood_pressure_data(db: Session, user_id: int, data: list[dict]):
+    objects_to_add = [models.BloodPressure(user_id=user_id, **entry) for entry in data]
+    db.bulk_save_objects(objects_to_add)
+    db.commit()
+
+def add_oxygen_saturation_data(db: Session, user_id: int, data: list[dict]):
+    objects_to_add = [models.OxygenSaturation(user_id=user_id, **entry) for entry in data]
+    db.bulk_save_objects(objects_to_add)
+    db.commit()
