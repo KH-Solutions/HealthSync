@@ -1,0 +1,12 @@
+# Environment files
+.env
+
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# node_modules folder from frontend project
+node_modules/

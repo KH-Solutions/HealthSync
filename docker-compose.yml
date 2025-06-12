@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # Service definition for our Python backend
+  backend:
+    build: ./backend  # Indicates that Docker should build the image from the Dockerfile in the ./backend folder
+    container_name: health_sync_backend
+    env_file:
+      - ./backend/.env # Injects environment variables from the .env file into the container
+    ports:
+      - "8000:8000" # Maps port 8000 on your computer to port 8000 in the container
+    volumes:
+      - ./backend:/app # Maps the backend folder to /app in the container, allowing for "hot-reloading"
+    depends_on:
+      - db # The backend will start only after the database is ready
+
+  # Service definition for our TimescaleDB database
+  db:
+    image: timescale/timescaledb:latest-pg14 # We use the official TimescaleDB image
+    container_name: health_sync_db
+    environment:
+      # Set database credentials. You can change them.
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: health_sync
+    ports:
+      - "5432:5432" # Maps the default PostgreSQL port
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data # We use a named volume to persist database data
+
+# Definition of a named volume so that database data survives container restarts
+volumes:
+  timescaledb-data:

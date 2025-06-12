@@ -1,0 +1,6 @@
+fastapi[all]
+google-auth-oauthlib
+python-dotenv
+SQLAlchemy
+psycopg2-binary
+httpx
