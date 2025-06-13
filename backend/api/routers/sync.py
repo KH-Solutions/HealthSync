@@ -6,11 +6,10 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime as dt, timedelta, timezone
 from dateutil.parser import isoparse
-
 from api.deps import get_db
 from db import models, crud
-
 from api.routers.data import get_steps_data, get_heart_rate_data, get_sleep_summary
+from services.google_fit_service import get_and_refresh_credentials
 
 router = APIRouter(
     tags=["Synchronization & Export"]
@@ -85,21 +84,24 @@ async def sync_user_data(
     if not db_user:
         return JSONResponse(status_code=404, content={"message": "User not found."})
     
-    access_token = db_user.access_token
+    # STEP 1: Obtain a valid token (refreshed if necessary)
+    credentials = get_and_refresh_credentials(db=db, user=db_user)
+    if not credentials or not credentials.token:
+        return JSONResponse(
+            status_code=401,
+            content={"message": "Failed to refresh token or token is invalid. Please re-authenticate."}
+        )
+    
+    access_token = credentials.token
     headers = {"Authorization": f"Bearer {access_token}"}
     end_time = dt.now(timezone.utc)
     start_time = end_time - timedelta(days=days)
     sync_results = {}
     
+    # STEP 2: Use a valid token to synchronize data
     async with httpx.AsyncClient() as client:
         # Loops for AGGREGATE and LIST data
         for data_category, data_configs in DATA_TYPE_CONFIG.items():
-            endpoint_template = ""
-            if data_category == "AGGREGATE":
-                endpoint_template = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
-            elif data_category == "LIST":
-                endpoint_template = "https://www.googleapis.com/fitness/v1/users/me/dataSources/{data_source}/datasets/{start_ns}-{end_ns}"
-
             for data_key, config in data_configs.items():
                 if data_key in exclude:
                     sync_results[data_key] = "Skipped on request."
@@ -108,17 +110,13 @@ async def sync_user_data(
                 db.query(config["model"]).filter(config["model"].user_id == user_id).delete()
                 
                 if data_category == "AGGREGATE":
-                    request_body = {
-                        "aggregateBy": [{"dataTypeName": config["dataTypeName"]}],
-                        "bucketByTime": {"durationMillis": 86400000},
-                        "startTimeMillis": int(start_time.timestamp() * 1000),
-                        "endTimeMillis": int(end_time.timestamp() * 1000)
-                    }
-                    response = await client.post(endpoint_template, json=request_body, headers=headers)
-                else: # data_category == "LIST"
-                    data_source_id = f"derived:{config['dataTypeName']}:com.google.android.gms:merged"
-                    endpoint_url = endpoint_template.format(data_source=data_source_id, start_ns=int(start_time.timestamp() * 1e9), end_ns=int(end_time.timestamp() * 1e9))
-                    response = await client.get(endpoint_url, headers=headers)
+                    endpoint = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
+                    body = {"aggregateBy": [{"dataTypeName": config["dataTypeName"]}], "bucketByTime": {"durationMillis": 86400000}, "startTimeMillis": int(start_time.timestamp() * 1000), "endTimeMillis": int(end_time.timestamp() * 1000)}
+                    response = await client.post(endpoint, json=body, headers=headers)
+                else: # LIST
+                    source = f"derived:{config['dataTypeName']}:com.google.android.gms:merged"
+                    endpoint = f"https://www.googleapis.com/fitness/v1/users/me/dataSources/{source}/datasets/{int(start_time.timestamp() * 1e9)}-{int(end_time.timestamp() * 1e9)}"
+                    response = await client.get(endpoint, headers=headers)
                 
                 if response.status_code != 200:
                     sync_results[data_key] = f"Error: {response.status_code}"
@@ -126,7 +124,7 @@ async def sync_user_data(
                 
                 if data_category == "AGGREGATE":
                     parsed_data = parse_aggregate_response(response.json(), config["parser"])
-                else: # data_category == "LIST"
+                else: # LIST
                     raw_data = response.json().get("point", [])
                     parsed_data = [config["parser"](point) for point in raw_data if point.get("value")]
                 
@@ -137,24 +135,24 @@ async def sync_user_data(
         # Section for sleep (handled separately)
         if "sleep" not in exclude:
             # db.query(models.Sleep).filter(models.Sleep.user_id == user_id).delete() // TODO: Uncomment if you want to clear sleep data before sync
-            sessions_endpoint = "https://www.googleapis.com/fitness/v1/users/me/sessions"
+            endpoint = "https://www.googleapis.com/fitness/v1/users/me/sessions"
             params = {"startTime": start_time.isoformat(timespec='seconds') + "Z", "endTime": end_time.isoformat(timespec='seconds') + "Z", "activityType": 72}
-            response = await client.get(sessions_endpoint, headers=headers, params=params)
+            response = await client.get(endpoint, headers=headers, params=params)
             
             if response.status_code != 200:
                 sync_results["sleep"] = f"Error: {response.status_code}, Details: {response.text}"
             else:
-                sleep_sessions = response.json().get("session", [])
-                parsed_sleep_segments = []
-                for session in sleep_sessions:
+                sessions = response.json().get("session", [])
+                segments = []
+                for session in sessions:
                     for dataset in session.get("dataset", []):
                         if "sleep.segment" in dataset.get("dataSourceId", ""):
                             for point in dataset.get("point", []):
                                 if point.get("value") and point["value"][0].get("intVal"):
-                                    parsed_sleep_segments.append({"start_time": dt.fromtimestamp(int(point["startTimeNanos"]) / 1e9, tz=timezone.utc), "end_time": dt.fromtimestamp(int(point["endTimeNanos"]) / 1e9, tz=timezone.utc), "value": point["value"][0]["intVal"]})
-                if parsed_sleep_segments:
-                    crud.add_sleep_data(db=db, user_id=user_id, data=parsed_sleep_segments)
-                sync_results["sleep"] = f"Processed {len(parsed_sleep_segments)} sleep segments from {len(sleep_sessions)} sessions."
+                                    segments.append({"start_time": dt.fromtimestamp(int(point["startTimeNanos"]) / 1e9, tz=timezone.utc), "end_time": dt.fromtimestamp(int(point["endTimeNanos"]) / 1e9, tz=timezone.utc), "value": point["value"][0]["intVal"]})
+                if segments:
+                    crud.add_sleep_data(db=db, user_id=user_id, data=segments)
+                sync_results["sleep"] = f"Processed {len(segments)} sleep segments from {len(sessions)} sessions."
         else:
             sync_results["sleep"] = "Skipped on request."
 
@@ -192,7 +190,6 @@ def export_user_data_as_hl7_json(user_id: int, db: Session = Depends(get_db)):
     # Sleep
     sleep_summary = get_sleep_summary(user_id=user_id, db=db)
     if sleep_summary.data_available and sleep_summary.total_duration_minutes is not None:
-        # We use now() as timestamp, because the summary does not have a specific time
         hl7_message.append(create_obx_segment(obx_sequence_id, "2482-2", "Sleep duration", sleep_summary.total_duration_minutes, "min", dt.now(timezone.utc)))
         obx_sequence_id += 1
         

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str
     GOOGLE_CLIENT_SECRET: str
     REDIRECT_URI: str
+    GOOGLE_TOKEN_URI: str = "https://accounts.google.com/o/oauth2/token" #  URI for refreshing tokens
 
     # We set the default value to "0", so if the variable does not exist,
     # insecure mode will be disabled.
