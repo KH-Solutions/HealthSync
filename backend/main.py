@@ -8,6 +8,10 @@ from google_auth_oauthlib.flow import Flow
 from starlette.requests import Request
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
+from typing import List
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime as dt
+from collections import defaultdict
 
 # Imports from our db module that we created
 from db import models, crud, database
@@ -31,6 +35,14 @@ app = FastAPI(
 origins = [
     "http://localhost:3000",
 ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,       # List of allowed origins
+    allow_credentials=True,      # Allow cookies
+    allow_methods=["*"],         # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],         # Allow all headers
+)
 
 # --- Google Authorization Configuration ---
 
@@ -186,15 +198,9 @@ async def auth_google_callback(request: Request, db: Session = Depends(database.
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": f"Error while saving to the database: {e}"})
     
-    # Return a response confirming success
-    return JSONResponse(
-        status_code=200,
-        content={
-            "message": "User successfully logged in and saved to the database.",
-            "user_id_internal": db_user.id,
-            "email": db_user.email
-        }
-    )
+    frontend_url = "http://localhost:3000"
+    redirect_url_with_params = f"{frontend_url}?user_id={db_user.id}&email={db_user.email}"
+    return RedirectResponse(url=redirect_url_with_params)
 
 def parse_aggregate_response(response_json: dict, parser_func: callable) -> list[dict]:
     """Universal function to parse Google Fit aggregate responses."""
@@ -218,19 +224,19 @@ async def sync_user_data(user_id: int, days: int = 7, db: Session = Depends(data
     access_token = db_user.access_token
     headers = {"Authorization": f"Bearer {access_token}"}
     
-    end_time = datetime.now(timezone.utc)
+    end_time = dt.now(timezone.utc)
     start_time = end_time - timedelta(days=days)
     
     sync_results = {}
     
     async with httpx.AsyncClient() as client:
-        # --- LOOP FOR AGGREGATED DATA ---
+        # --- LOOP FOR AGGREGATED DATA (steps, heart_rate) ---
         aggregate_endpoint = "https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate"
         for data_key, config in DATA_TYPE_CONFIG["AGGREGATE"].items():
             db.query(config["model"]).filter(config["model"].user_id == user_id).delete()
             request_body = {
                 "aggregateBy": [{"dataTypeName": config["dataTypeName"]}],
-                "bucketByTime": {"durationMillis": 3600000}, 
+                "bucketByTime": {"durationMillis": 86400000},
                 "startTimeMillis": int(start_time.timestamp() * 1000),
                 "endTimeMillis": int(end_time.timestamp() * 1000)
             }
@@ -243,32 +249,199 @@ async def sync_user_data(user_id: int, days: int = 7, db: Session = Depends(data
                 config["crud_function"](db=db, user_id=user_id, data=parsed_data)
             sync_results[data_key] = f"Processed {len(parsed_data)} entries."
 
-        # --- LOOP FOR RAW DATA (LIST) ---
-        # We use a different endpoint: users/me/dataSources/{dataTypeName}/datasets/{time}
+        # --- LOOP FOR RAW DATA (LIST) (oxygen, blood_pressure) ---
         list_endpoint_template = "https://www.googleapis.com/fitness/v1/users/me/dataSources/{data_source}/datasets/{start_ns}-{end_ns}"
-        
         for data_key, config in DATA_TYPE_CONFIG["LIST"].items():
             db.query(config["model"]).filter(config["model"].user_id == user_id).delete()
-            
             data_source_id = f"derived:{config['dataTypeName']}:com.google.android.gms:merged"
-            
             endpoint_url = list_endpoint_template.format(
                 data_source=data_source_id,
                 start_ns=int(start_time.timestamp() * 1e9),
                 end_ns=int(end_time.timestamp() * 1e9)
             )
-            
             response = await client.get(endpoint_url, headers=headers)
             if response.status_code != 200:
                 sync_results[data_key] = f"Error: {response.status_code}"
                 continue
-            
             raw_data = response.json().get("point", [])
             parsed_data = [config["parser"](point) for point in raw_data if point.get("value")]
-
             if parsed_data:
                 config["crud_function"](db=db, user_id=user_id, data=parsed_data)
             sync_results[data_key] = f"Processed {len(parsed_data)} entries."
+            
+        # --- SLEEP HANDLING SECTION ---
+        # db.query(models.Sleep).filter(models.Sleep.user_id == user_id).delete()  # TODO: Restore this line if you want to clear sleep data before sync
+        sessions_endpoint = "https://www.googleapis.com/fitness/v1/users/me/sessions"
+        params = {
+            "startTime": start_time.isoformat(timespec='seconds') + "Z",
+            "endTime": end_time.isoformat(timespec='seconds') + "Z",
+            "activityType": 72  # Code for sleep
+        }
+        
+        response = await client.get(sessions_endpoint, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            sync_results["sleep"] = f"Error: {response.status_code}, Details: {response.text}"
+        else:
+            sleep_sessions = response.json().get("session", [])
+            parsed_sleep_segments = []
+            for session in sleep_sessions:
+                for dataset in session.get("dataset", []):
+                    if "sleep.segment" in dataset.get("dataSourceId", ""):
+                        for point in dataset.get("point", []):
+                            if point.get("value") and point["value"][0].get("intVal"):
+                                parsed_sleep_segments.append({
+                                    "start_time": dt.fromtimestamp(int(point["startTimeNanos"]) / 1e9, tz=timezone.utc),
+                                    "end_time": dt.fromtimestamp(int(point["endTimeNanos"]) / 1e9, tz=timezone.utc),
+                                    "value": point["value"][0]["intVal"]
+                                })
+            
+            if parsed_sleep_segments:
+                crud.add_sleep_data(db=db, user_id=user_id, data=parsed_sleep_segments)
+            
+            sync_results["sleep"] = f"Processed {len(parsed_sleep_segments)} sleep segments from {len(sleep_sessions)} sessions."
 
     db.commit()
     return {"message": "Synchronization completed.", "details": sync_results}
+
+
+class StepData(BaseModel):
+    timestamp: dt
+    value: int
+    
+    model_config = ConfigDict(from_attributes=True)
+
+@app.get("/users/{user_id}/data/steps", response_model=List[StepData], tags=["Data Retrieval"])
+def get_steps_data(user_id: int, db: Session = Depends(database.get_db)):
+    """
+    Retrieves stored step data for the given user from the database.
+    """
+    steps = db.query(models.Steps).filter(models.Steps.user_id == user_id).order_by(models.Steps.timestamp).all()
+    if not steps:
+        return []
+    return steps
+
+class HeartRateData(BaseModel):
+    timestamp: dt
+    value: float 
+    
+    model_config = ConfigDict(from_attributes=True)
+
+@app.get("/users/{user_id}/data/heart_rate", response_model=List[HeartRateData], tags=["Data Retrieval"])
+def get_heart_rate_data(user_id: int, db: Session = Depends(database.get_db)):
+    """
+    Retrieves stored heart rate data for the given user from the database.
+    """
+    heart_rates = db.query(models.HeartRate).filter(models.HeartRate.user_id == user_id).order_by(models.HeartRate.timestamp).all()
+    if not heart_rates:
+        return []
+    return heart_rates
+
+class SleepSummary(BaseModel):
+    data_available: bool
+    total_duration_minutes: int | None = None
+    start_time: dt | None = None
+    end_time: dt | None = None
+
+@app.get("/users/{user_id}/data/sleep/summary", response_model=SleepSummary, tags=["Data Retrieval"])
+def get_sleep_summary(user_id: int, db: Session = Depends(database.get_db)):
+    """
+    Retrieves and analyzes sleep data for the user, returning a summary of the last night.
+    """
+    # 1. Find the latest sleep segment for the given user
+    latest_segment = (
+        db.query(models.Sleep)
+        .filter(models.Sleep.user_id == user_id)
+        .order_by(models.Sleep.end_time.desc())
+        .first()
+    )
+
+    if not latest_segment:
+        return SleepSummary(data_available=False)
+
+    # 2. Based on the latest segment, estimate the entire session time.
+    # We assume that a full sleep session does not last longer than 16 hours.
+    session_end_time = latest_segment.end_time
+    session_start_threshold = session_end_time - timedelta(hours=16)
+
+    # 3. Retrieve all segments that belong to this last session.
+    session_segments = (
+        db.query(models.Sleep)
+        .filter(
+            models.Sleep.user_id == user_id,
+            models.Sleep.start_time >= session_start_threshold,
+            models.Sleep.end_time <= session_end_time
+        )
+        .all()
+    )
+    
+    if not session_segments:
+        # This situation should not occur if latest_segment was found, but it's a good safeguard
+        return SleepSummary(data_available=False)
+
+    # 4. Sum the duration of all segments that are actual sleep.
+    total_sleep_duration = timedelta()
+    sleep_phase_codes = [4, 5, 6]  # 4:light, 5:deep, 6:REM
+
+    for segment in session_segments:
+        if segment.value in sleep_phase_codes:
+            duration = segment.end_time - segment.start_time
+            total_sleep_duration += duration
+    
+    if total_sleep_duration.total_seconds() == 0:
+        return SleepSummary(data_available=False)
+
+    return SleepSummary(
+        data_available=True,
+        total_duration_minutes=int(total_sleep_duration.total_seconds() / 60)
+    )
+
+class DailySleepData(BaseModel):
+    date: str
+    total_duration_minutes: int
+
+@app.get("/users/{user_id}/data/sleep", response_model=List[DailySleepData], tags=["Data Retrieval"])
+def get_daily_sleep_data(user_id: int, db: Session = Depends(database.get_db)):
+    """
+    Returns a list of daily sleep summaries from the last 30 days for charting purposes.
+    """
+    # 1. Retrieve all sleep segments from the last 30 days
+    time_threshold = dt.now(timezone.utc) - timedelta(days=30)
+    all_segments = (
+        db.query(models.Sleep)
+        .filter(models.Sleep.user_id == user_id, models.Sleep.end_time > time_threshold)
+        .order_by(models.Sleep.start_time)
+        .all()
+    )
+
+    if not all_segments:
+        return []
+
+    # 2. Group segments by the day the user woke up
+    # We use defaultdict to easily append to lists
+    daily_segments = defaultdict(list)
+    for segment in all_segments:
+        # The key is the "wake up" date (end_time)
+        day_key = segment.end_time.date().isoformat()
+        daily_segments[day_key].append(segment)
+
+    # 3. Process each group (each day) into a single entry
+    daily_summaries = []
+    sleep_phase_codes = [4, 5, 6]
+
+    for day, segments in daily_segments.items():
+        total_sleep_duration = timedelta()
+        for segment in segments:
+            if segment.value in sleep_phase_codes:
+                duration = segment.end_time - segment.start_time
+                total_sleep_duration += duration
+        
+        if total_sleep_duration.total_seconds() > 0:
+            daily_summaries.append(
+                DailySleepData(
+                    date=day,
+                    total_duration_minutes=int(total_sleep_duration.total_seconds() / 60)
+                )
+            )
+    
+    return sorted(daily_summaries, key=lambda x: x.date)
