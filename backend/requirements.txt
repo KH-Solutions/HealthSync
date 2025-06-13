@@ -5,3 +5,5 @@ SQLAlchemy
 psycopg2-binary
 httpx
 fastapi-cors
+python-dateutil
+sqlalchemy-timescaledb

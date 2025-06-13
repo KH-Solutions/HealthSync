@@ -35,12 +35,9 @@ def create_or_update_user(db: Session, google_id: str, email: str, access_token:
     return db_user
 
 def add_steps_data(db: Session, user_id: int, data: list[dict]): 
-    """ Dodaje wpisy dotyczące kroków dla danego użytkownika. """
+    """ Adds step entries for the given user. """
     objects_to_add = []
     for entry in data:
-        # Ten kod konwertujący timestamp jest specyficzny dla kroków,
-        # ponieważ w poprzednim kroku tak go napisaliśmy. Uprośćmy go.
-        # Nowa, uniwersalna funkcja parse_aggregate_response już zwraca obiekty datetime.
         db_entry = models.Steps(
             user_id=user_id,
             timestamp=entry["timestamp"],
