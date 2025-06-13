@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import Dashboard from "./components/Dashboard"; // Importujemy nasz nowy komponent
+import Dashboard from "./components/Dashboard";
 
 interface User {
     id: number;
@@ -13,6 +13,12 @@ export default function Home() {
 
     const handleLogin = () => {
         window.location.href = "http://localhost:8000/auth/google/login";
+    };
+
+    const handleLogout = () => {
+        localStorage.removeItem("health_sync_user");
+        setUser(null);
+        window.location.href = "/";
     };
 
     useEffect(() => {
@@ -47,7 +53,7 @@ export default function Home() {
                     </button>
                 </div>
             ) : (
-                <Dashboard user={user} />
+                <Dashboard user={user} onLogout={handleLogout} />
             )}
         </main>
     );

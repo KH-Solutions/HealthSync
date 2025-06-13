@@ -13,6 +13,7 @@ type User = {
 
 type DashboardProps = {
     user: User;
+    onLogout: () => void; 
 };
 
 type HealthDataPoint = {
@@ -30,7 +31,7 @@ type DailySleepData = {
     total_duration_minutes: number;
 };
 
-const Dashboard: React.FC<DashboardProps> = ({ user }) => {
+const Dashboard: React.FC<DashboardProps> = ({ user, onLogout }) => {
     // --- Component State Hooks ---
     const [syncDetails, setSyncDetails] = useState<Record<string, string> | null>(null);
     const [isLoading, setIsLoading] = useState(true);
@@ -51,13 +52,11 @@ const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                 fetch(`http://localhost:8000/users/${user.id}/data/sleep/summary`),
                 fetch(`http://localhost:8000/users/${user.id}/data/sleep`)
             ]);
-
-            // Bezpiecznie parsujemy odpowiedzi i aktualizujemy stany
+            
             if (stepsResponse.ok) setStepsData(await stepsResponse.json());
             if (heartRateResponse.ok) setHeartRateData(await heartRateResponse.json());
             if (sleepSummaryResponse.ok) setSleepSummary(await sleepSummaryResponse.json());
             if (sleepHistoryResponse.ok) setSleepHistory(await sleepHistoryResponse.json());
-
         } catch (error) {
             console.error("Wystąpił błąd podczas pobierania danych:", error);
         }
@@ -91,9 +90,7 @@ const Dashboard: React.FC<DashboardProps> = ({ user }) => {
     };
 
     const formatSleepDuration = (totalMinutes?: number): string => {
-        if (typeof totalMinutes !== 'number' || totalMinutes <= 0) {
-            return "--";
-        }
+        if (typeof totalMinutes !== 'number' || totalMinutes <= 0) return "--";
         const hours = Math.floor(totalMinutes / 60);
         const minutes = totalMinutes % 60;
         return `${hours}h ${minutes}m`;
@@ -127,13 +124,21 @@ const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                     <h2 className="text-2xl font-bold">Panel Główny</h2>
                     <p className="text-gray-400">Zalogowano jako: {user.email}</p>
                 </div>
-                <button
-                    onClick={handleSync}
-                    disabled={isLoading}
-                    className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
-                >
-                    {isLoading ? 'Przetwarzanie...' : 'Odśwież dane z Google Fit'}
-                </button>
+                <div className="flex items-center gap-4">
+                    <button
+                        onClick={onLogout}
+                        className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition-colors"
+                    >
+                        Wyloguj
+                    </button>
+                    <button
+                        onClick={handleSync}
+                        disabled={isLoading}
+                        className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
+                    >
+                        {isLoading ? 'Przetwarzanie...' : 'Odśwież dane'}
+                    </button>
+                </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
